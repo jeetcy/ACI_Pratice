@@ -1,0 +1,127 @@
+---
+# Builds a 3-tier app with contracts (+ logging) in ACI.
+# Needs: ansible-galaxy collection install cisco.aci
+- name: Build PROD tenant with 3-tier app
+  hosts: localhost
+  gather_facts: false
+  vars:
+    tenant: PROD
+    vrf: VRF1
+    ap: APP1
+    tiers:
+      - { name: WEB, gw: 10.1.1.1, mask: 24 }
+      - { name: APP, gw: 10.1.2.1, mask: 24 }
+      - { name: DB,  gw: 10.1.3.1, mask: 24 }
+    contracts:
+      - { name: HTTPS-443, port: 443,  provider: WEB, consumer: APP }   # change consumer to your L3Out ext-EPG for users
+      - { name: APP-8080,  port: 8080, provider: APP, consumer: WEB }
+      - { name: SQL-1433,  port: 1433, provider: DB,  consumer: APP }
+
+  module_defaults:
+    group/cisco.aci.all:
+      host: "{{ lookup('env', 'APIC_URL') | regex_replace('^https?://', '') }}"
+      username: "{{ lookup('env', 'APIC_USER') }}"
+      password: "{{ lookup('env', 'APIC_PASS') }}"
+      validate_certs: false        # lab only, use true in production
+      state: present
+
+  tasks:
+    - name: Tenant
+      cisco.aci.aci_tenant:
+        tenant: "{{ tenant }}"
+
+    - name: VRF
+      cisco.aci.aci_vrf:
+        tenant: "{{ tenant }}"
+        vrf: "{{ vrf }}"
+        policy_control_preference: enforced
+
+    - name: Bridge domains
+      cisco.aci.aci_bd:
+        tenant: "{{ tenant }}"
+        bd: "BD-{{ item.name }}"
+        vrf: "{{ vrf }}"
+        enable_routing: true
+        limit_ip_learn: true
+      loop: "{{ tiers }}"
+
+    - name: BD subnets (gateways)
+      cisco.aci.aci_bd_subnet:
+        tenant: "{{ tenant }}"
+        bd: "BD-{{ item.name }}"
+        gateway: "{{ item.gw }}"
+        mask: "{{ item.mask }}"
+        scope: [private]
+      loop: "{{ tiers }}"
+
+    - name: Application profile
+      cisco.aci.aci_ap:
+        tenant: "{{ tenant }}"
+        ap: "{{ ap }}"
+
+    - name: EPGs
+      cisco.aci.aci_epg:
+        tenant: "{{ tenant }}"
+        ap: "{{ ap }}"
+        epg: "{{ item.name }}"
+        bd: "BD-{{ item.name }}"
+      loop: "{{ tiers }}"
+
+    - name: Filters
+      cisco.aci.aci_filter:
+        tenant: "{{ tenant }}"
+        filter: "tcp-{{ item.port }}"
+      loop: "{{ contracts }}"
+
+    - name: Filter entries
+      cisco.aci.aci_filter_entry:
+        tenant: "{{ tenant }}"
+        filter: "tcp-{{ item.port }}"
+        entry: "tcp-{{ item.port }}"
+        ether_type: ip
+        ip_protocol: tcp
+        dst_port_start: "{{ item.port }}"
+        dst_port_end: "{{ item.port }}"
+      loop: "{{ contracts }}"
+
+    - name: Contracts
+      cisco.aci.aci_contract:
+        tenant: "{{ tenant }}"
+        contract: "{{ item.name }}"
+        scope: context
+      loop: "{{ contracts }}"
+
+    - name: Contract subjects
+      cisco.aci.aci_contract_subject:
+        tenant: "{{ tenant }}"
+        contract: "{{ item.name }}"
+        subject: "{{ item.name }}"
+        reverse_filter: true
+      loop: "{{ contracts }}"
+
+    - name: Attach filter to subject, with logging
+      cisco.aci.aci_contract_subject_to_filter:
+        tenant: "{{ tenant }}"
+        contract: "{{ item.name }}"
+        subject: "{{ item.name }}"
+        filter: "tcp-{{ item.port }}"
+        log: log
+      loop: "{{ contracts }}"
+
+    - name: Provider EPGs
+      cisco.aci.aci_epg_to_contract:
+        tenant: "{{ tenant }}"
+        ap: "{{ ap }}"
+        epg: "{{ item.provider }}"
+        contract: "{{ item.name }}"
+        contract_type: provider
+      loop: "{{ contracts }}"
+
+    - name: Consumer EPGs
+      cisco.aci.aci_epg_to_contract:
+        tenant: "{{ tenant }}"
+        ap: "{{ ap }}"
+        epg: "{{ item.consumer }}"
+        contract: "{{ item.name }}"
+        contract_type: consumer
+      loop: "{{ contracts }}"

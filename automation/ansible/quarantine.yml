@@ -1,0 +1,61 @@
+---
+# Quarantine (or release) a host by IP using a uSeg EPG with NO contracts.
+#   ansible-playbook quarantine.yml -e host_ip=10.1.2.45
+#   ansible-playbook quarantine.yml -e host_ip=10.1.2.45 -e state=absent
+# The uSeg EPG must use the SAME BD as the host's base EPG (see microsegmentation/02-useg-epg.md).
+# For bare-metal hosts, also add a static leaf binding to the uSeg EPG.
+- name: Quarantine host
+  hosts: localhost
+  gather_facts: false
+  vars:
+    tenant: PROD
+    ap: APP1
+    bd: BD-APP                  # BD where the host lives
+    useg_epg: uSeg-QUARANTINE
+    state: present
+    attr_name: "q-{{ host_ip | replace('.', '-') }}"
+
+  module_defaults:
+    group/cisco.aci.all:
+      host: "{{ lookup('env', 'APIC_URL') | regex_replace('^https?://', '') }}"
+      username: "{{ lookup('env', 'APIC_USER') }}"
+      password: "{{ lookup('env', 'APIC_PASS') }}"
+      validate_certs: false
+
+  tasks:
+    - name: Check input
+      ansible.builtin.assert:
+        that: host_ip is defined
+        fail_msg: "Pass the host IP:  -e host_ip=10.1.2.45"
+
+    - name: Make sure the quarantine uSeg EPG exists (no contracts = isolated)
+      cisco.aci.aci_rest:
+        path: "/api/mo/uni/tn-{{ tenant }}/ap-{{ ap }}.json"
+        method: post
+        content:
+          fvAEPg:
+            attributes: { name: "{{ useg_epg }}", isAttrBasedEPg: "yes" }
+            children:
+              - fvRsBd: { attributes: { tnFvBDName: "{{ bd }}" } }
+              - fvCrtrn: { attributes: { name: default, match: any } }
+
+    - name: Add the host IP to quarantine
+      when: state == 'present'
+      cisco.aci.aci_rest:
+        path: "/api/mo/uni/tn-{{ tenant }}/ap-{{ ap }}/epg-{{ useg_epg }}/crtrn.json"
+        method: post
+        content:
+          fvIpAttr: { attributes: { name: "{{ attr_name }}", ip: "{{ host_ip }}" } }
+
+    - name: Release the host from quarantine
+      when: state == 'absent'
+      cisco.aci.aci_rest:
+        path: "/api/mo/uni/tn-{{ tenant }}/ap-{{ ap }}/epg-{{ useg_epg }}/crtrn/ipattr-{{ attr_name }}.json"
+        method: delete
+
+    - name: Next step
+      ansible.builtin.debug:
+        msg: >-
+          Done ({{ state }}). Verify on the leaf:
+          'show system internal epm endpoint ip {{ host_ip }}' (pcTag should be the uSeg EPG's)
+          and 'show logging ip access-list internal packet-log deny'.
